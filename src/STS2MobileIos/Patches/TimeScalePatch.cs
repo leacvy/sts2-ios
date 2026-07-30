@@ -18,7 +18,7 @@ namespace STS2MobileIos.Patches;
 // 慢动作演出相对比例原样保留(0.1→0.4 起步),结束时"恢复"到的正是 4x,两者不再打架。
 public static class TimeScalePatch
 {
-    private const double TARGET_SCALE = 4.0;
+    private const double TARGET_SCALE = 1.0;
 
     // postfix on MegaCrit.Sts2.Core.Nodes.NGame._Ready
     // NGame 每次进入(启动、从主菜单进对局)都会 _Ready,在此设定全局倍率并保持。

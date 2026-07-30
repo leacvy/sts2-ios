@@ -36,3 +36,6 @@ ios-export/.work/
 *.log
 *.pid
 save_backups/
+ios-export/appicon/
+.gstack/
+ios-export/appicon-src.png

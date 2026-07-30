@@ -47,6 +47,8 @@ ok "前置齐全"
 step "1/6 重新织入最新 sts2.dll（补丁 + 游戏原始程序集）"
 cd "$ROOT" || fail "cd 失败"
 cp "$GAME_DATA/sts2.dll" "$WORK/sts2.dll" || fail "拷贝游戏 sts2.dll 失败"
+# 织入写出时 Cecil 需解析 sts2.dll 的依赖(如 Sentry 常量默认值类型)，把游戏其余程序集链到 sts2.dll 旁供 weaver resolver 解析
+for _d in "$GAME_DATA"/*.dll; do [ "$(basename "$_d")" = sts2.dll ] && continue; ln -sf "$_d" "$WORK/$(basename "$_d")"; done
 dotnet build src/STS2MobileIos -c Release -o "$WORK/mobilepatch-out" >"$WORK/patch-build.log" 2>&1 \
   || fail "补丁库编译失败，见 $WORK/patch-build.log"
 dotnet run --project src/STS2Weaver -c Release -- \
@@ -147,6 +149,10 @@ cat > "$ENT" <<EOF
 </dict></plist>
 EOF
 ok "内存权限 entitlements 已备: $ENT"
+# 同时注入工程 entitlements：Xcode Run 出的基座 app 即含大内存权限(省得每次手动加 capability)
+PROJ_ENT="$EXPORT_DIR/build/StS2/StS2.entitlements"
+[ -f "$PROJ_ENT" ] && /usr/libexec/PlistBuddy -c "Add :com.apple.developer.kernel.increased-memory-limit bool true" "$PROJ_ENT" 2>/dev/null \
+  && ok "大内存权限已注入工程 entitlements"
 
 step "5.5/6 游戏内容包三连处理（移 sentry + 补 672 脚本占位 → 官方引擎能加载）"
 # MegaDot 私有引擎打的 pck 与官方引擎的 C# 脚本/扩展机制冲突,必须两处修:

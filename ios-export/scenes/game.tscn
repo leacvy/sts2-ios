@@ -1,0 +1,6 @@
+; STS2 iOS 导出壳的占位主场景。
+; 真正的游戏内容来自游戏自己的 pck（step 5.5 用真 pck 替换本工程导出的占位 pck）。
+; 本场景仅为满足 Godot 导出"至少一个可打包资源"的要求。
+[gd_scene format=3]
+
+[node name="Game" type="Node2D"]

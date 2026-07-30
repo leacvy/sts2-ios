@@ -2,23 +2,35 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Threading.Tasks;
 using Godot;
 
 namespace STS2MobileIos.Patches;
 
-// 首次启动预编译全部着色器,消除游戏中"遇到新画面时现场编译"的卡顿。
-// 移植自安卓 ShaderWarmupScreen,但做了三处 iOS 适配:
+// 首次启动预编译着色器,消除游戏中"遇到新画面时现场编译"的卡顿(尤其战局中卡牌首次打出)。
+// 移植自安卓 ShaderWarmupScreen,做了多处 iOS 适配:
 //  1. 不继承 Node/Control —— 本补丁在独立 assembly(STS2MobileIos),不在 Godot 主 assembly
 //     的脚本注册表里,做成 Godot 节点其生命周期回调不会触发。改为纯静态逻辑 + SceneTree 信号驱动。
-//  2. 去掉全部 UI(进度条/面板依赖 Launcher.Components),改用 PatchHelper.Log 输出进度。
-//  3. 触发点: postfix NGame._EnterTree(游戏根节点进树,SceneTree+资源系统就绪),async 后台跑,
-//     不阻塞(安卓是阻塞式预热屏,我们无 Launcher,改后台;首次会卡一阵,写 marker 后永久跳过)。
+//  2. 去掉全部 UI,改用 PatchHelper.Log 输出进度。
+//  3. 触发点: postfix NGame._EnterTree,async 后台跑,不阻塞。
+//
+// 【4GB 设备(iPad Pro 11" 2018 iPad8,1)内存实测结论 —— 决定了当前策略】
+//  - 早期"全部材质+场景一次性 load 进缓存再统一编译" → 峰值爆表,被 iOS jetsam SIGKILL(signal 9)。
+//  - 改流式(逐个 load→编译→释放)后: 【材质阶段(~2580 个,CacheMode.Ignore)实测能完整跑完不被杀】,
+//    但【场景阶段(~947 个 .tscn)会累积内存被杀】—— 场景的 ext_resource 纹理依赖累加是主因;
+//    换 IgnoreDeep 想绕开缓存累加,反而因逐材质重载共享依赖(churn)让材质阶段都更早崩。
+//  - 且 Godot 在此 iOS 构建上 OS.GetMemoryInfo() 的 "available" 返回 -1(拿不到 os_proc_available_memory),
+//    无法在循环里读余量自我节流。
+//  => 故当前只做【材质阶段(普通 Ignore,唯一实测安全的配置)】,跳过场景阶段。卡牌着色器几乎都是
+//     独立材质/.gdshader 资源,材质阶段即可覆盖,消除卡牌卡顿;场景阶段边角覆盖为避免 OOM 舍弃。
 public static class ShaderWarmupPatch
 {
-    private const int WarmupVersion = 5;
+    private const int WarmupVersion = 8;
     private const int BatchSize = 8;
+
+    // 每加载 N 个资源就让一帧,防止首次从冷 pck 批量加载时主线程连续卡 >10s 触发看门狗。
+    private const int YieldEvery = 4;
+
     private static bool _started = false;
 
     // postfix on MegaCrit.Sts2.Core.Nodes.NGame._EnterTree
@@ -40,7 +52,7 @@ public static class ShaderWarmupPatch
                 PatchHelper.Log("[ShaderWarmup] SceneTree 不可用,跳过");
                 return;
             }
-            // fire-and-forget 后台预热
+            // fire-and-forget 后台流式预热(仅材质阶段,内存有界)
             _ = RunWarmup(tree);
         }
         catch (Exception ex)
@@ -79,29 +91,20 @@ public static class ShaderWarmupPatch
         }
     }
 
+    // 流式预热主流程(仅材质阶段)。内存有界: 任一时刻只驻留"当前批(<=BatchSize 个材质)"。
     private static async Task RunWarmup(SceneTree tree)
     {
         var sw = Stopwatch.StartNew();
+        LogMemory("启动");
+        SubViewport viewport = null;
         try
         {
             // 等主菜单先加载显示,减少与游戏启动的资源竞争
             for (int f = 0; f < 30; f++)
                 await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
-            await tree.ToSignal(
-                RenderingServer.Singleton,
-                RenderingServer.SignalName.FramePostDraw
-            );
+            await tree.ToSignal(RenderingServer.Singleton, RenderingServer.SignalName.FramePostDraw);
 
-            var materials = await CollectMaterialsAsync(tree);
-            PatchHelper.Log($"[ShaderWarmup] 收集到 {materials.Count} 个待编译着色器");
-
-            if (materials.Count == 0)
-            {
-                WriteVersionMarker();
-                return;
-            }
-
-            var viewport = new SubViewport
+            viewport = new SubViewport
             {
                 Size = new Vector2I(64, 64),
                 RenderTargetUpdateMode = SubViewport.UpdateMode.Always,
@@ -113,47 +116,110 @@ public static class ShaderWarmupPatch
             whiteImage.SetPixel(0, 0, Colors.White);
             var whiteTex = ImageTexture.CreateFromImage(whiteImage);
 
-            int total = materials.Count;
-            for (int i = 0; i < total; i += BatchSize)
+            // 已编译着色器的 key 集合(只存字符串,极省内存)。用它去重,避免重复编译。
+            var warmed = new HashSet<string>();
+            // 当前批的预热节点: 渲染若干帧后统一释放,峰值只保留 <=BatchSize 个材质。
+            var batch = new List<Node>(BatchSize);
+            int compiled = 0;
+
+            // 渲染两帧强制编译当前批,随后 QueueFree 并再让一帧确保回收,峰值不累积。
+            async Task FlushBatch()
             {
-                var batchNodes = new List<Node>();
-                int batchEnd = Math.Min(i + BatchSize, total);
-                for (int j = i; j < batchEnd; j++)
-                {
-                    try
-                    {
-                        var node = CreateWarmupNode(materials[j].mat, whiteTex);
-                        if (node != null)
-                        {
-                            viewport.AddChild(node);
-                            batchNodes.Add(node);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        PatchHelper.Log($"[ShaderWarmup] 建节点失败 {materials[j].path}: {ex.Message}");
-                    }
-                }
-
+                if (batch.Count == 0)
+                    return;
                 await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
                 await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
-
-                foreach (var node in batchNodes)
-                    node.QueueFree();
-
-                if (i % 64 == 0)
-                    PatchHelper.Log($"[ShaderWarmup] 进度 {batchEnd}/{total}");
+                foreach (var n in batch)
+                    n.QueueFree();
+                batch.Clear();
+                await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
             }
 
+            // 把一个材质纳入预热(仅新着色器才建节点)。材质随节点释放,不缓存。
+            async Task WarmMaterial(Material mat)
+            {
+                if (mat == null)
+                    return;
+                string key;
+                try
+                {
+                    key = GetShaderKey(mat);
+                }
+                catch
+                {
+                    return; // 材质已被回收等,跳过不致命
+                }
+                if (!warmed.Add(key))
+                    return; // 该着色器已编译过
+                Node node;
+                try
+                {
+                    node = CreateWarmupNode(mat, whiteTex);
+                }
+                catch
+                {
+                    return;
+                }
+                if (node == null)
+                    return;
+                viewport.AddChild(node);
+                batch.Add(node);
+                compiled++;
+                if (batch.Count >= BatchSize)
+                    await FlushBatch();
+            }
+
+            // ── 材质/着色器资源文件(逐个 load→预热→释放,唯一实测安全的阶段)──
+            var matPaths = new List<string>();
+            CollectMaterialPaths("res://", matPaths);
+            PatchHelper.Log($"[ShaderWarmup] 流式预热: {matPaths.Count} 个材质/着色器资源");
+            for (int i = 0; i < matPaths.Count; i++)
+            {
+                await WarmMaterial(LoadMaterialStreaming(matPaths[i]));
+                if (i % YieldEvery == 0)
+                    await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
+            }
+            await FlushBatch();
+
             viewport.QueueFree();
+            viewport = null;
             WriteVersionMarker();
+            LogMemory("结束");
             PatchHelper.Log(
-                $"[ShaderWarmup] 完成: {total} 个着色器,耗时 {sw.ElapsedMilliseconds}ms。下次启动将跳过。"
+                $"[ShaderWarmup] 完成: 编译 {compiled} 个着色器,耗时 {sw.ElapsedMilliseconds}ms。下次启动将跳过。"
             );
         }
         catch (Exception ex)
         {
             PatchHelper.Log($"[ShaderWarmup] 预热失败: {ex}");
+            try
+            {
+                viewport?.QueueFree();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+    }
+
+    private static void LogMemory(string tag)
+    {
+        try
+        {
+            var info = OS.GetMemoryInfo();
+            if (info == null)
+                return;
+            long phys = info.ContainsKey("physical") ? info["physical"].AsInt64() : -1;
+            long avail = info.ContainsKey("available") ? info["available"].AsInt64() : -1;
+            PatchHelper.Log(
+                $"[ShaderWarmup] 内存({tag}) physical={(phys > 0 ? phys / 1024 / 1024 : phys)}MB "
+                    + $"available={(avail > 0 ? avail / 1024 / 1024 : avail)}MB"
+            );
+        }
+        catch
+        {
+            // 仅诊断用
         }
     }
 
@@ -173,79 +239,6 @@ public static class ShaderWarmupPatch
         return new Sprite2D { Texture = whiteTex, Material = mat };
     }
 
-    // 每加载 N 个资源就让一帧, 防止首次从冷 pck 批量加载时主线程连续卡 >10s 触发看门狗。
-    private const int YieldEvery = 4;
-
-    private static async Task<List<(string path, Material mat)>> CollectMaterialsAsync(
-        SceneTree tree
-    )
-    {
-        // 边加载边按 shader 去重: 每个材质刚加载出来(必然还活着)时立刻算 key 入表。
-        // 不能先攒进 dict、末尾再统一算 key —— 高频让帧期间 Godot 会驱逐已加载资源,
-        // 到统一去重时材质已被释放, GetShaderKey 抛 ObjectDisposedException 使整个预热中止。
-        var unique = new Dictionary<string, (string path, Material mat)>();
-        int seen = 0;
-
-        // 1) 先只列路径(纯目录遍历, 便宜), 再异步逐个加载 + 即时去重, 高频让帧。
-        var matPaths = new List<string>();
-        CollectMaterialPaths("res://", matPaths);
-        PatchHelper.Log($"[ShaderWarmup] 扫描 {matPaths.Count} 个材质/着色器资源");
-        for (int i = 0; i < matPaths.Count; i++)
-        {
-            if (LoadAndAdd(matPaths[i], unique))
-                seen++;
-            if (i % YieldEvery == 0)
-                await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
-        }
-
-        var scenePaths = new List<string>();
-        CollectScenePaths("res://scenes", scenePaths);
-        PatchHelper.Log($"[ShaderWarmup] 扫描 {scenePaths.Count} 个场景");
-
-        for (int i = 0; i < scenePaths.Count; i++)
-        {
-            try
-            {
-                var packed = ResourceLoader.Load<PackedScene>(
-                    scenePaths[i],
-                    null,
-                    ResourceLoader.CacheMode.Reuse
-                );
-                if (packed != null)
-                    seen += ExtractMaterialsFromSceneState(packed, scenePaths[i], unique);
-            }
-            catch (Exception ex)
-            {
-                PatchHelper.Log($"[ShaderWarmup] 提取场景失败 {scenePaths[i]}: {ex.Message}");
-            }
-            if (i % YieldEvery == 0)
-                await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
-        }
-
-        PatchHelper.Log($"[ShaderWarmup] {seen} 个材质 → {unique.Count} 个唯一着色器");
-        return unique.Values.ToList();
-    }
-
-    // 刚加载出的材质立刻算 key 入 unique 表; 单个被回收/异常只跳过不致命。
-    // 返回是否成功计入(仅用于统计)。
-    private static bool TryAddUnique(
-        Dictionary<string, (string path, Material mat)> unique,
-        string path,
-        Material mat
-    )
-    {
-        try
-        {
-            unique.TryAdd(GetShaderKey(mat), (path, mat));
-            return true;
-        }
-        catch (Exception ex)
-        {
-            PatchHelper.Log($"[ShaderWarmup] 去重跳过 {path}: {ex.Message}");
-            return false;
-        }
-    }
-
     private static string GetShaderKey(Material mat)
     {
         if (mat is ShaderMaterial sm && sm.Shader != null)
@@ -255,7 +248,7 @@ public static class ShaderWarmupPatch
         return mat.ResourcePath ?? mat.GetRid().ToString();
     }
 
-    // 只列候选资源路径(便宜的目录遍历, 不加载), 实际加载交给异步循环高频让帧。
+    // 只列候选资源路径(便宜的目录遍历, 不加载), 实际加载交给流式循环。
     private static void CollectMaterialPaths(string dirPath, List<string> outPaths)
     {
         try
@@ -294,125 +287,37 @@ public static class ShaderWarmupPatch
         }
     }
 
-    // 加载单个材质/着色器资源, 成功则立刻算 key 入 unique 表(趁其还活着)。返回是否计入。
-    private static bool LoadAndAdd(
-        string cleanPath,
-        Dictionary<string, (string path, Material mat)> unique
-    )
+    // 流式加载单个材质/着色器资源。CacheMode.Ignore: 不进资源缓存,本地引用一丢即回收,峰值不累积。
+    // (实测: 材质阶段用 Ignore 能完整跑完;换 IgnoreDeep 会因逐材质重载共享依赖 churn 而更早 OOM。)
+    private static Material LoadMaterialStreaming(string cleanPath)
     {
         try
         {
             if (!ResourceLoader.Exists(cleanPath))
-                return false;
-            Material mat = null;
+                return null;
             if (cleanPath.EndsWith(".tres"))
             {
-                mat =
-                    ResourceLoader.Load(cleanPath, "Material", ResourceLoader.CacheMode.Reuse)
+                var mat =
+                    ResourceLoader.Load(cleanPath, "Material", ResourceLoader.CacheMode.Ignore)
                     as Material;
-                if (mat == null)
-                {
-                    var shader =
-                        ResourceLoader.Load(cleanPath, "Shader", ResourceLoader.CacheMode.Reuse)
-                        as Shader;
-                    if (shader != null)
-                        mat = new ShaderMaterial { Shader = shader };
-                }
+                if (mat != null)
+                    return mat;
+                var shader =
+                    ResourceLoader.Load(cleanPath, "Shader", ResourceLoader.CacheMode.Ignore)
+                    as Shader;
+                return shader != null ? new ShaderMaterial { Shader = shader } : null;
             }
-            else
-            {
-                var res = ResourceLoader.Load(cleanPath, null, ResourceLoader.CacheMode.Reuse);
-                if (res is Material resMat)
-                    mat = resMat;
-                else if (res is Shader resShader)
-                    mat = new ShaderMaterial { Shader = resShader };
-            }
-            if (mat != null)
-                return TryAddUnique(unique, cleanPath, mat);
-            return false;
+            var res = ResourceLoader.Load(cleanPath, null, ResourceLoader.CacheMode.Ignore);
+            if (res is Material resMat)
+                return resMat;
+            if (res is Shader resShader)
+                return new ShaderMaterial { Shader = resShader };
+            return null;
         }
         catch (Exception ex)
         {
             PatchHelper.Log($"[ShaderWarmup] 加载失败 {cleanPath}: {ex.Message}");
-            return false;
+            return null;
         }
-    }
-
-    private static void CollectScenePaths(string dirPath, List<string> paths)
-    {
-        try
-        {
-            using var dir = DirAccess.Open(dirPath);
-            if (dir == null)
-                return;
-            dir.ListDirBegin();
-            string fileName;
-            while ((fileName = dir.GetNext()) != "")
-            {
-                if (fileName == "." || fileName == "..")
-                    continue;
-                var fullPath = $"{dirPath}/{fileName}";
-                if (dir.CurrentIsDir())
-                {
-                    if (fileName == "debug")
-                        continue;
-                    CollectScenePaths(fullPath, paths);
-                    continue;
-                }
-                var cleanName = fileName.Replace(".remap", "");
-                if (!cleanName.EndsWith(".tscn"))
-                    continue;
-                var cleanPath = $"{dirPath}/{cleanName}";
-                if (ResourceLoader.Exists(cleanPath))
-                    paths.Add(cleanPath);
-            }
-            dir.ListDirEnd();
-        }
-        catch (Exception ex)
-        {
-            PatchHelper.Log($"[ShaderWarmup] 枚举场景失败 {dirPath}: {ex.Message}");
-        }
-    }
-
-    // 从场景状态里提取材质, 每个刚取出即算 key 入 unique(趁其还活着)。返回计入数量。
-    private static int ExtractMaterialsFromSceneState(
-        PackedScene packed,
-        string scenePath,
-        Dictionary<string, (string path, Material mat)> unique
-    )
-    {
-        int added = 0;
-        var state = packed.GetState();
-        int nodeCount = state.GetNodeCount();
-        for (int n = 0; n < nodeCount; n++)
-        {
-            int propCount = state.GetNodePropertyCount(n);
-            for (int p = 0; p < propCount; p++)
-            {
-                var propName = state.GetNodePropertyName(n, p).ToString();
-                if (
-                    propName != "material"
-                    && propName != "process_material"
-                    && propName != "surface_material_override/0"
-                )
-                    continue;
-                try
-                {
-                    var val = state.GetNodePropertyValue(n, p);
-                    Material mat = null;
-                    if (val.Obj is Material m)
-                        mat = m;
-                    else if (val.Obj is Shader shader)
-                        mat = new ShaderMaterial { Shader = shader };
-                    if (mat != null && TryAddUnique(unique, $"{scenePath}#node{n}#{propName}", mat))
-                        added++;
-                }
-                catch (Exception ex)
-                {
-                    PatchHelper.Log($"[ShaderWarmup] 读属性失败 {propName}@{scenePath}: {ex.Message}");
-                }
-            }
-        }
-        return added;
     }
 }

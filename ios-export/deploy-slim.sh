@@ -26,6 +26,24 @@ fail(){ echo "❌ $1"; exit 1; }
 [ -f "$PUB" ] || fail "新 dylib 不存在: $PUB（先跑 build-ios.sh）"
 [ -n "$APP" ] && [ -d "$APP" ] || fail "DerivedData 里找不到已构建的 StS2.app（先用 Xcode GUI 完整构建一次）"
 [ -f "$ENT" ] || fail "entitlements 不存在: $ENT（先跑 build-ios.sh 生成）"
+# 0.5) 装机前自动备份手机存档到【本项目目录】(纯保险)。
+#   本脚本用升级安装、绝不 uninstall,本就不动存档;这一步只是多一层兜底,防任何意外。
+#   存档在已装 App 容器的 Documents/default/(与装机同一 bundle: $STS2_BUNDLE_ID)。
+#   手机无存档/不可达/首次装机 → 跳过,不阻断部署。备份保留最近 20 份。
+#   备份目录 save_backups/ 已在 .gitignore(存档是个人数据,永不入库)。
+SAVE_BK_DIR="$SCRIPT_DIR/save_backups"
+SAVE_BK="$SAVE_BK_DIR/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$SAVE_BK"
+if xcrun devicectl device copy from --device "$DEV" \
+     --domain-type appDataContainer --domain-identifier "$STS2_BUNDLE_ID" \
+     --source "Documents/default" --destination "$SAVE_BK" >/dev/null 2>&1 \
+   && [ -n "$(ls -A "$SAVE_BK" 2>/dev/null)" ]; then
+  echo "✅ 已备份手机存档 → $SAVE_BK"
+  ls -1dt "$SAVE_BK_DIR"/*/ 2>/dev/null | tail -n +21 | while read -r d; do rm -rf "$d"; done
+else
+  echo "ℹ️ 手机暂无存档或不可达,跳过备份(不阻断部署)"
+  rm -rf "$SAVE_BK"
+fi
 # 1) 换新织入 dylib 进 .app
 cp "$PUB" "$APP/Frameworks/sts2.framework/sts2" || fail "换 dylib 失败"
 echo "✅ 新 dylib 已换入 ($(shasum "$PUB" | cut -c1-12))"

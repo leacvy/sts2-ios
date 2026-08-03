@@ -31,6 +31,16 @@ public static class QuickRestartPatch
 {
     private const string ButtonName = "RestartRoom";
 
+    // 重开是一次完整场景重载(退主菜单→Continue)。两处防崩:
+    //  ① 重入锁: 快速连点/淡出窗口内重复触发只执行一次(叠两条重载链必崩)。
+    //  ② 场景释放帧等待: 见 ReloadCurrentRunAsync 注释。
+    private static bool _reloadInProgress;
+
+    // ReturnToMainMenu 内部 SetCurrentScene 把旧 NRun 从树里移除后 queue_free(帧末延迟释放),
+    // 补丁若立刻同步发起下一次整场景重载会与"旧场景仍在释放"竞态 → 间歇 NRE(玩家手动
+    // 退菜单→点Continue之间天然隔了几秒,不会踩到)。等若干帧让延迟释放跑完 + 新菜单 settle。
+    private const int SettleFrames = 4;
+
     // postfix on MegaCrit.Sts2.Core.Nodes.Screens.PauseMenu.NPauseMenu._Ready (iOS/移动版).
     // 加"一键重开"按钮 + 6 格存档位快照(时光回溯)。
     public static void ReadyPostfix(object __instance)
@@ -135,6 +145,13 @@ public static class QuickRestartPatch
     // on-disk checkpoint is honoured verbatim.
     public static async Task ReloadCurrentRunAsync()
     {
+        // ① 重入锁: 淡出/加载窗口内重复触发直接忽略,避免叠两条重载链(间歇崩的主因之一)。
+        if (_reloadInProgress)
+        {
+            PatchHelper.Log("[QuickRestart] reload 已在进行中,忽略本次触发");
+            return;
+        }
+        _reloadInProgress = true;
         try
         {
             var game = NGame.Instance;
@@ -155,10 +172,20 @@ public static class QuickRestartPatch
                 return;
             }
 
+            // ② 让旧 NRun 的延迟 queue_free 真正跑完 + 新菜单 settle,再发起下一次整场景重载。
+            //    否则会与"旧场景仍在释放"竞态 → 间歇 NRE(见 SettleFrames 注释)。
+            var tree = (SceneTree)Engine.GetMainLoop();
+            if (tree != null)
+            {
+                for (int i = 0; i < SettleFrames; i++)
+                    await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
+            }
+
             // Re-read the run save from disk into the main menu's cached result.
             menu.RefreshButtons();
 
             // Run the exact Continue-button logic (private) to reload the run.
+            // OnContinueButtonPressed 内含存档有效性判空 + FadeOut,复用最稳。
             var mi = PatchHelper.Method(menu.GetType(), "OnContinueButtonPressed");
             if (mi == null)
             {
@@ -171,7 +198,12 @@ public static class QuickRestartPatch
         }
         catch (Exception ex)
         {
+            // 打完整 ex(含堆栈): 万一仍崩,真机 devicectl --console 能直接定位。
             PatchHelper.Log($"[QuickRestart] ReloadCurrentRunAsync failed: {ex}");
+        }
+        finally
+        {
+            _reloadInProgress = false;
         }
     }
 }

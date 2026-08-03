@@ -165,11 +165,17 @@ strings "$PREBUILT/sts2.dll" | grep -oE 'res://[A-Za-z0-9_/.]+\.cs' | sort -u > 
 CSN=$(wc -l < "$WORK/cs_paths.txt" | tr -d ' ')
 python3 "$ROOT/tools/pck_add_cs.py" "$WORK/pck_nosentry.pck" "$WORK/cs_paths.txt" "$EXPORT_DIR/build/StS2.pck" >"$WORK/pck2.log" 2>&1 \
   || fail "pck 补脚本占位失败,见 $WORK/pck2.log"
+# 5.5.4 修 FMOD GDExtension iOS 加载(治本): fmod.gdextension 的 ios 路径 .xcframework→.framework。
+#   否则 Godot 4.5 gdextension_library_loader 把 .xcframework 判为静态库,open_dynamic_library
+#   传空路径走 RTLD_SELF,dlsym(fmod_library_init) 在主二进制找不到 → FMOD 扩展加载失败 →
+#   背景音乐+战斗音效等全部 FMOD 音频静默(Godot 原生 mp3 音效不受影响)。改成 .framework 即走
+#   动态加载,dlopen 到 deploy-slim 注入的 libGodotFmod.ios.template_release.framework。
+python3 "$ROOT/tools/pck_patch_fmod_ext.py" "$EXPORT_DIR/build/StS2.pck" || fail "修 FMOD gdextension 失败"
 GOTCS=$(python3 "$ROOT/tools/pck_ls.py" "$EXPORT_DIR/build/StS2.pck" ls 2>/dev/null | grep -c '\.cs$')
 GOTSENT=$(python3 "$ROOT/tools/pck_ls.py" "$EXPORT_DIR/build/StS2.pck" ls 2>/dev/null | grep -c 'sentry.gdextension')
 [ "$GOTCS" -ge 600 ] || fail "pck 脚本占位数异常: $GOTCS (期望 ~$CSN)"
 [ "$GOTSENT" = "0" ] || fail "pck 仍含 sentry: $GOTSENT"
-ok "游戏内容包就位: $(du -h "$EXPORT_DIR/build/StS2.pck"|cut -f1), $GOTCS 脚本占位, 0 sentry"
+ok "游戏内容包就位: $(du -h "$EXPORT_DIR/build/StS2.pck"|cut -f1), $GOTCS 脚本占位, 0 sentry, FMOD ext 已修"
 
 step "6/6 签名 + 装机（免费账号必须走 Xcode GUI,命令行 xcodebuild 会 No Accounts）"
 cat <<GUIDE
